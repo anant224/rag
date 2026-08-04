@@ -1,0 +1,15 @@
+langchain
+langchain-community
+jq
+langchain-huggingface
+sentence-transformers
+langchain-chroma
+langchain-google-genai
+langchain
+langchain-community
+jq
+langchain-huggingface
+sentence-transformers
+langchain-chroma
+langchain-google-genai
+python-dotenv
