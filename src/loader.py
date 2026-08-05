@@ -7,6 +7,11 @@ class DocumentLoader:
     def __init__(self, folder_path: str):
         self.folder_path = Path(folder_path)
 
+    def _metadata_func(self, record: dict, metadata: dict) -> dict:
+        metadata["city"] = record.get("city")
+        metadata["place"] = record.get("place")
+        return metadata
+
     def load_documents(self):
         documents = []
 
@@ -15,14 +20,15 @@ class DocumentLoader:
 
             documents += DirectoryLoader(
                 self.folder_path,
-                glob="**/*.jsonl",         # loads ALL .jsonl files (your 50-60 files)
+                glob="**/*.jsonl",              
                 loader_cls=JSONLoader,
                 loader_kwargs={
-                    "jq_schema": ".",       # take the whole JSON object on each line
-                    "text_content": False,  # allow non-string JSON values to load
-                    "json_lines": True,     # IMPORTANT: one JSON object per line
+                    "jq_schema": ".",           
+                    "content_key": "description",  
+                    "json_lines": True,        
+                    "metadata_func": self._metadata_func,
                 },
-                show_progress=True,         # nice progress bar for 60 files
+                show_progress=True,
             ).load()
 
             print(f"Loaded {len(documents)} place records")

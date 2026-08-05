@@ -8,7 +8,7 @@ class Vectorizer:
         self.CHROMA_DIR = CHROMA_DIR
         self.embedding = embedding
 
-    # Use this the FIRST time -> creates the DB from your place documents
+    # FIRST time -> creates DB from place documents
     def build_vector(self, documents):
         vector_db = Chroma.from_documents(
             documents=documents,
@@ -18,7 +18,7 @@ class Vectorizer:
         print("Vector store created")
         return vector_db
 
-    # Use this LATER -> loads the DB that already exists on disk
+    # LATER runs -> loads the saved DB
     def load_vector_store(self):
         vector_db = Chroma(
             persist_directory=self.CHROMA_DIR,
@@ -27,8 +27,9 @@ class Vectorizer:
         print("Vector store loaded")
         return vector_db
 
-    # Turns the DB into a retriever (top-k similarity search)
-    def create_retriever(self, vector_store, k=3):
-        return vector_store.as_retriever(
-            search_kwargs={"k": k}
-        )
+    # retriever WITH city filter -> only that city's places come back
+    def create_retriever(self, vector_store, city=None, k=5):
+        search_kwargs = {"k": k}
+        if city:
+            search_kwargs["filter"] = {"city": city}
+        return vector_store.as_retriever(search_kwargs=search_kwargs)
