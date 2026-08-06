@@ -1,0 +1,54 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: "Segoe UI", Arial, sans-serif;
+    background: #f4f6fb; height: 100vh;
+    display: flex; flex-direction: column; color: #222;
+}
+.topbar {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 14px 28px; background: #fff; border-bottom: 1px solid #e6e8ef;
+}
+.brand { font-size: 22px; font-weight: 700; }
+.brand span {
+    background: linear-gradient(90deg, #4f8cff, #22c1c3);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+}
+.newchat {
+    padding: 8px 18px; border: 1px solid #4f8cff; color: #4f8cff;
+    background: #fff; border-radius: 20px; font-weight: 600; cursor: pointer;
+}
+.newchat:hover { background: #eef4ff; }
+.chat-wrap {
+    flex: 1; width: 100%; max-width: 900px; margin: 0 auto;
+    padding: 24px 20px; overflow-y: auto; display: flex; flex-direction: column;
+}
+.intro h1 { color: #4f5bd5; font-size: 26px; }
+.intro p { color: #777; margin-top: 6px; margin-bottom: 18px; }
+.messages { display: flex; flex-direction: column; gap: 12px; }
+.msg {
+    max-width: 80%; padding: 14px 16px; border-radius: 14px;
+    line-height: 1.55; white-space: pre-wrap; font-size: 15px;
+}
+.msg.bot  { background: #eef1fb; align-self: flex-start; border-bottom-left-radius: 4px; }
+.msg.user { background: #4f8cff; color: #fff; align-self: flex-end; border-bottom-right-radius: 4px; }
+.starters { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 20px; }
+.starters button {
+    padding: 12px 18px; background: #fff; border: 1px solid #e0e3ee;
+    border-radius: 24px; font-size: 14px; font-weight: 600; cursor: pointer; transition: all .15s;
+}
+.starters button:hover { border-color: #4f8cff; color: #4f8cff; }
+.inputbar {
+    display: flex; gap: 12px; padding: 16px 20px; background: #fff;
+    border-top: 1px solid #e6e8ef; max-width: 900px; width: 100%; margin: 0 auto;
+}
+.inputbar input {
+    flex: 1; padding: 14px 16px; border: 1px solid #d5d9e6;
+    border-radius: 28px; font-size: 15px; outline: none;
+}
+.inputbar input:focus { border-color: #4f8cff; }
+.inputbar button {
+    padding: 0 26px; background: linear-gradient(90deg, #4f8cff, #22c1c3);
+    color: #fff; border: none; border-radius: 28px; font-size: 15px; font-weight: 700; cursor: pointer;
+}
+.inputbar button:disabled { opacity: .5; cursor: not-allowed; }

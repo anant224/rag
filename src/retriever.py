@@ -1,3 +1,11 @@
+"""
+retriever.py
+------------
+Takes the place Documents that Chroma returns and turns them into clean
+text (with nearby spots + local food) that the itinerary LLM can read.
+"""
+
+
 class Retriever:
 
     def __init__(self, retriever):
@@ -9,13 +17,13 @@ class Retriever:
 
     def format_context(self, documents: list) -> str:
         if not documents:
-            raise Exception("No relevant documents found.")
+            return ""
 
         blocks = []
         for i, doc in enumerate(documents, start=1):
             m = doc.metadata
-            nearby = ", ".join(m.get("nearby_places") or [])
-            food = ", ".join(m.get("local_food") or [])
+            nearby = (m.get("nearby_places") or "").replace(",", ", ")
+            food = (m.get("local_food") or "").replace(",", ", ")
             block = (
                 f"[{i}] {m.get('place', 'unknown')} ({m.get('city', '')})\n"
                 f"About: {doc.page_content}\n"

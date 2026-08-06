@@ -1,17 +1,21 @@
+# --- Core LangChain + LangGraph ---
 langchain
 langchain-community
-jq
+langchain-core
+langgraph
+
+# --- Embeddings (HuggingFace all-MiniLM-L6-v2) ---
 langchain-huggingface
 sentence-transformers
+
+# --- Vector DB ---
 langchain-chroma
+
+# --- LLM (Google Gemini) ---
 langchain-google-genai
-langchain
-langchain-community
-jq
-langchain-huggingface
-sentence-transformers
-langchain-chroma
-langchain-google-genai
-python-dotenv
+
+# --- Backend / web ---
 fastapi
 uvicorn
+python-dotenv
+pydantic

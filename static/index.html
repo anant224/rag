@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>QuanTrip AI</title>
+    <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+    <header class="topbar">
+        <div class="brand">✈️ <span>QuanTrip AI</span></div>
+        <button id="newChat" class="newchat">New Chat</button>
+    </header>
+
+    <main class="chat-wrap">
+        <div class="intro">
+            <h1>Your AI Travel Planner</h1>
+            <p>Ask me to recommend destinations, plan itineraries, estimate budgets, or answer travel questions.</p>
+        </div>
+
+        <div id="messages" class="messages">
+            <div class="msg bot">
+                Hi! 👋 I'm your travel planner. Tell me what kind of trip you're dreaming of, or pick a starter below to get going.
+            </div>
+        </div>
+
+        <div id="starters" class="starters">
+            <button data-intent="recommend" data-text="Recommend a place for me">🏖️ Recommend a place</button>
+            <button data-intent="itinerary" data-text="Plan a trip for me">🗺️ Plan a trip</button>
+            <button data-intent="budget" data-text="Estimate a budget for my trip">💰 Estimate budget</button>
+            <button data-intent="qa" data-text="I have a travel question">❓ Ask a travel question</button>
+        </div>
+    </main>
+
+    <footer class="inputbar">
+        <input id="input" type="text" placeholder="Type your message..." autocomplete="off" />
+        <button id="send">Send</button>
+    </footer>
+
+    <script src="script.js"></script>
+</body>
+</html>

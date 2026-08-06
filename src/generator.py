@@ -1,3 +1,11 @@
+"""
+generator.py
+------------
+Talks to Gemini. Two jobs:
+  1. generate()      -> send any prompt, get the text answer back
+  2. build_prompt()  -> builds the brochure-style itinerary prompt
+"""
+
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 
@@ -6,15 +14,32 @@ class Generator:
     def __init__(self, model_name: str, api_key: str):
         self.model = ChatGoogleGenerativeAI(
             model=model_name,
-            temperature=0,
+            temperature=0.2,
             google_api_key=api_key,
         )
 
     def generate(self, prompt: str) -> str:
-        return self.model.invoke(prompt).content
+            result = self.model.invoke(prompt)
+            content = result.content
 
-    def build_prompt(self, question, rag_context):
-        return f"""You are a smart travel itinerary planner. Create an engaging, realistic, day-by-day itinerary using ONLY the places in the Retrieved Context. Do not invent places, food, or facts that are not present in the context.
+            # Gemini sometimes returns content as a LIST of parts -> join into text
+            if isinstance(content, list):
+                text = ""
+                for part in content:
+                    if isinstance(part, str):
+                        text += part
+                    elif isinstance(part, dict):
+                        text += part.get("text", "")
+                return text
+
+            return content
+    
+
+    def build_prompt(self, question, rag_context, city_intro=""):
+        return f"""You are a smart travel itinerary planner. Create an engaging, realistic, day-by-day itinerary using ONLY the places in the Retrieved Context. Do not invent places, food, or facts.
+
+City Intro (for a warm opening line):
+{city_intro}
 
 Retrieved Context (available places, with nearby spots and food options):
 {rag_context}
@@ -25,28 +50,22 @@ User's Trip Request:
 Instructions:
 1. Use ONLY places from the Retrieved Context. Never add places not listed there.
 2. Match places to the user's travel types and spread them across the exact number of days.
-3. For each day, write a short catchy TITLE that captures the theme of that day.
-4. Under each day, write descriptive bullet points in full friendly sentences (not just place names). Naturally group activities into morning, afternoon and evening flow WITHOUT writing exact clock times.
-5. In the bullets, also mention what the traveler can DO nearby (using the Nearby info from the context) and suggest a FOOD option or local dish (using the Local food info from the context).
-6. End each day with a "Highlight of the day:" line and a short helpful "Note:" line.
-7. Keep the tone warm and engaging, like a travel brochure. Bold the important place names.
+3. For each day, write a short catchy TITLE that captures the theme of the day.
+4. Under each day, write friendly full-sentence bullets. Group the flow into morning, afternoon and evening WITHOUT exact clock times.
+5. In the bullets, mention what the traveler can DO nearby and suggest a FOOD option / local dish from the context.
+6. End each day with a "Highlight of the day:" line and a short "Note:" line.
+7. Warm, brochure-like tone. Bold the important place names.
 
-FORMAT (follow this style exactly):
+FORMAT:
 
 Day 1 | <Catchy Day Title>
 ------------------------------------------------
-- <Full descriptive sentence about the first activity, mentioning the place in bold.>
-- <Another sentence covering a nearby spot they can explore.>
-- <A sentence suggesting a food option or local dish to try.>
+- <descriptive sentence with the place in bold>
+- <nearby spot they can explore>
+- <a food option / local dish to try>
 Highlight of the day: <short highlight>
-Note: <short practical note>
+Note: <short note>
 
-Day 2 | <Catchy Day Title>
-------------------------------------------------
-- ...
-Highlight of the day: ...
-Note: ...
-
-(Repeat for every day. Keep it clean, warm, and easy to read.)
+(Repeat for each day.)
 
 Now generate the itinerary:"""
