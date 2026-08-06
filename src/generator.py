@@ -11,31 +11,42 @@ class Generator:
         )
 
     def generate(self, prompt: str) -> str:
-        response = self.model.invoke(prompt)
-        return response.content[0]["text"]
+        return self.model.invoke(prompt).content
 
-    def build_prompt(self, question: str, memory_context: str, rag_context: str) -> str:
-        return f"""You are a smart travel itinerary planner. Create a clear, realistic, day-by-day itinerary using ONLY the places in the Retrieved Context below. Do not invent places, prices, or facts that are not present in the Retrieved Context.
+    def build_prompt(self, question, rag_context):
+        return f"""You are a smart travel itinerary planner. Create an engaging, realistic, day-by-day itinerary using ONLY the places in the Retrieved Context. Do not invent places, food, or facts that are not present in the context.
 
-Conversation History:
-{memory_context}
-
-Retrieved Context (available places and details):
+Retrieved Context (available places, with nearby spots and food options):
 {rag_context}
 
 User's Trip Request:
 {question}
 
-The request may include: Destination (city), Duration (days), Budget level (economy/moderate/luxury), Traveler count, and Travel types (one or more: religious, historical, shopping, food, adventure, etc.).
-
 Instructions:
 1. Use ONLY places from the Retrieved Context. Never add places not listed there.
-2. Match places to the user's travel types. If multiple types are given, include a good mix covering each.
-3. Spread places across the exact number of days. Group nearby places and keep a logical order (use timings/best_time when available).
-4. Respect budget (economy = free/low-cost, moderate = balanced, luxury = premium/higher-rated).
-5. Consider traveler count (family/couple/group-friendly) when the context mentions it.
-6. For each day use a simple Morning / Afternoon / Evening layout with the place name, why it fits, best time, cost, and a nearby food option from the context.
-7. If there aren't enough places for all days, say so honestly - do not fill with made-up places.
-8. Keep it clean and easy to follow with day-wise headings.
+2. Match places to the user's travel types and spread them across the exact number of days.
+3. For each day, write a short catchy TITLE that captures the theme of that day.
+4. Under each day, write descriptive bullet points in full friendly sentences (not just place names). Naturally group activities into morning, afternoon and evening flow WITHOUT writing exact clock times.
+5. In the bullets, also mention what the traveler can DO nearby (using the Nearby info from the context) and suggest a FOOD option or local dish (using the Local food info from the context).
+6. End each day with a "Highlight of the day:" line and a short helpful "Note:" line.
+7. Keep the tone warm and engaging, like a travel brochure. Bold the important place names.
+
+FORMAT (follow this style exactly):
+
+Day 1 | <Catchy Day Title>
+------------------------------------------------
+- <Full descriptive sentence about the first activity, mentioning the place in bold.>
+- <Another sentence covering a nearby spot they can explore.>
+- <A sentence suggesting a food option or local dish to try.>
+Highlight of the day: <short highlight>
+Note: <short practical note>
+
+Day 2 | <Catchy Day Title>
+------------------------------------------------
+- ...
+Highlight of the day: ...
+Note: ...
+
+(Repeat for every day. Keep it clean, warm, and easy to read.)
 
 Now generate the itinerary:"""

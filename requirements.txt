@@ -13,3 +13,5 @@ sentence-transformers
 langchain-chroma
 langchain-google-genai
 python-dotenv
+fastapi
+uvicorn

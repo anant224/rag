@@ -13,8 +13,15 @@ class Retriever:
 
         blocks = []
         for i, doc in enumerate(documents, start=1):
-            place = doc.metadata.get("place", "unknown")
-            city = doc.metadata.get("city", "unknown")
-            blocks.append(f"[{i}] ({place}, {city})\n{doc.page_content}")
+            m = doc.metadata
+            nearby = ", ".join(m.get("nearby_places") or [])
+            food = ", ".join(m.get("local_food") or [])
+            block = (
+                f"[{i}] {m.get('place', 'unknown')} ({m.get('city', '')})\n"
+                f"About: {doc.page_content}\n"
+                f"Nearby: {nearby}\n"
+                f"Local food: {food}"
+            )
+            blocks.append(block)
 
         return "\n\n".join(blocks)
