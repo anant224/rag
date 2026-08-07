@@ -11,9 +11,9 @@ class BudgetEstimator:
 
     # per-person-per-day rates (INR) -> this IS the economy/moderate/luxury factor
     RATES = {
-        "economy":  {"hotel": 800,  "food": 500,  "travel": 300,  "activities": 300},
-        "moderate": {"hotel": 2000, "food": 1000, "travel": 600,  "activities": 700},
-        "luxury":   {"hotel": 5000, "food": 2500, "travel": 1500, "activities": 1500},
+        "economy":  {"hotel": 600,  "food": 500,  "travel": 300,  "activities": 300},
+        "moderate": {"hotel": 1500, "food": 1000, "travel": 500,  "activities": 700},
+        "luxury":   {"hotel": 4000, "food": 2000, "travel": 1200, "activities": 1300},
     }
 
     # only list cities that differ from baseline (1.0). Unlisted cities = 1.0.

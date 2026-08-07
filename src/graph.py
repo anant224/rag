@@ -1,29 +1,23 @@
 """
 graph.py
 --------
-🟩 THE LANGGRAPH LAYER (the routing brain).
+The LangGraph routing brain.
 
-One user message = one graph run. The "state" (what we know + what we are
-waiting for) is passed in, updated, and returned. app.py stores it per
-session_id -> that is how the bot remembers the conversation.
+One user message = one graph run. The state is passed in, updated, and
+returned. app.py stores it per session_id -> that is the memory.
 
 FLOW:
-    router --> recommend
-           |-> itinerary
-           |-> budget
-           |-> qa
+    router --> recommend / itinerary / budget / qa
 
-HUMAN-IN-THE-LOOP:
-  If info is missing (city / days / travelers / budget / trip type) a node
-  ASKS for it and sets a "stage". loop_count caps the asks at 2, after which
-  missing info is auto-filled so the chat can never loop forever.
+CITY VALIDATION:
+    We only accept cities that exist in our data. Unknown cities get a
+    polite "try another city" message instead of a broken reply.
 """
 
 import re
 from typing import TypedDict
 from langgraph.graph import StateGraph, END
 
-# our LangChain tools
 from src.tools import (
     recommend_places,
     plan_itinerary,
@@ -32,11 +26,11 @@ from src.tools import (
 )
 
 
-# ---------- the shared state that flows through the graph ----------
+# ---------- the shared state ----------
 class ChatState(TypedDict, total=False):
     user_message: str
-    intent: str            # recommend / itinerary / budget / qa
-    stage: str             # what we are waiting for
+    intent: str
+    stage: str
     categories: list
     region: str
     recommended_cities: list
@@ -45,7 +39,7 @@ class ChatState(TypedDict, total=False):
     travelers: int
     budget_level: str
     loop_count: int
-    bot_response: str      # the reply we send back
+    bot_response: str
 
 
 # ---------- small text helpers ----------
@@ -86,13 +80,11 @@ def is_yes(text):
 
 
 # ===========================================================
-#  ChatBrain: builds the LangGraph and holds the services
+#  ChatBrain
 # ===========================================================
 class ChatBrain:
 
     def __init__(self, recommender, city_index, generator):
-        # we only need these three directly inside the nodes;
-        # the heavy work (itinerary/budget/qa) is done by the tools.
         self.recommender = recommender
         self.city_index = city_index
         self.generator = generator
@@ -124,13 +116,10 @@ class ChatBrain:
 
     # ---------------- ROUTER ----------------
     def router_node(self, state: ChatState):
-        # if we are mid-flow, keep the current intent
         if state.get("stage"):
             return state
-        # if a button already set the intent, trust it
         if state.get("intent") in ["recommend", "itinerary", "budget", "qa"]:
             return state
-        # otherwise ask the LLM to classify
         state["intent"] = self._classify(state.get("user_message", ""))
         return state
 
@@ -147,16 +136,16 @@ class ChatBrain:
     def _classify(self, msg):
         prompt = f"""Classify the user's travel message into ONE word.
 
-            - recommend : ONLY when they ask which CITY or DESTINATION to travel to
+- recommend : ONLY when they ask which CITY or DESTINATION to travel to
               (e.g. "suggest a place for holidays", "where should I go").
               Do NOT use this for food spots, things to do, or places WITHIN a city.
-            - itinerary : they want a trip plan / day-by-day schedule for a known city.
-            - budget    : they want a cost / budget estimate.
-            - qa        : ANY other travel question, including food, packing, weather,
+- itinerary : they want a trip plan / day-by-day schedule for a known city.
+- budget    : they want a cost / budget estimate.
+- qa        : ANY other travel question, including food, packing, weather,
               best time to visit, attractions, tips, or things to do in a city.
 
-            Message: "{msg}"
-            Answer with only one word (recommend/itinerary/budget/qa):"""
+Message: "{msg}"
+Answer with only one word (recommend/itinerary/budget/qa):"""
         out = self.generator.generate(prompt).strip().lower()
         for key in ["recommend", "itinerary", "budget", "qa"]:
             if key in out:
@@ -194,7 +183,7 @@ class ChatBrain:
         if cats:
             state["categories"] = cats
 
-        # not enough info yet -> ask once (respect the 2-loop cap)
+        # not enough info yet -> ask once (max 2 loops)
         if not state.get("categories") and loop < 2:
             state["stage"] = "rec_await_categories"
             state["loop_count"] = loop + 1
@@ -206,11 +195,10 @@ class ChatBrain:
             )
             return state
 
-        # 2 loops done and still nothing -> auto-fill
+        # 2 loops done -> auto-fill
         if not state.get("categories"):
             state["categories"] = self.recommender.auto_fill_categories()
 
-        # 🧰 call the LangChain TOOL
         cities = recommend_places.invoke({
             "categories": state["categories"],
             "region": state.get("region", ""),
@@ -233,11 +221,19 @@ class ChatBrain:
             state["bot_response"] = "Which city would you like a trip plan for? 🗺️"
             return state
 
+        # user typed a city -> VALIDATE it against our data
         if stage == "itin_await_city":
-            state["city"] = self._extract_city(msg) or msg.strip().title()
+            found = self._extract_city(msg)
+            if not found:
+                state["bot_response"] = (
+                    "Sorry, I don't have travel info for that city yet. 😔\n"
+                    "Please try another city (for example: Manali, Amritsar, Shimla, Goa)."
+                )
+                return state
+            state["city"] = found
             state["stage"] = "itin_await_details"
             state["bot_response"] = (
-                f"{state['city']} it is! How many days, how many travelers, "
+                f"{found} it is! How many days, how many travelers, "
                 "and which budget (economy / moderate / luxury)?"
             )
             return state
@@ -258,12 +254,11 @@ class ChatBrain:
                         "number of travelers, and budget (economy / moderate / luxury)."
                     )
                     return state
-                # auto-fill after 2 tries
                 state["days"] = state.get("days") or 3
                 state["travelers"] = state.get("travelers") or 2
                 state["budget_level"] = state.get("budget_level") or "moderate"
 
-        # 🧰 call the LangChain TOOL to build the itinerary
+        # build the itinerary
         itinerary = plan_itinerary.invoke({
             "city": state["city"],
             "days": state["days"],
@@ -271,7 +266,6 @@ class ChatBrain:
             "budget": state["budget_level"],
             "categories": state.get("categories") or [],
         })
-        # use a "bud_" stage so the router sends "yes" to the BUDGET node
         state["stage"] = "bud_await_budget_offer"
         state["intent"] = "budget"
         state["loop_count"] = 0
@@ -284,12 +278,12 @@ class ChatBrain:
         msg = state.get("user_message", "")
         loop = state.get("loop_count", 0)
 
-        # was offered after an itinerary
+        # offered after an itinerary
         if stage == "bud_await_budget_offer":
             if is_yes(msg):
                 return self._do_budget(state)
             state["stage"] = ""
-            state["intent"] = ""          # ⭐ FIX 2: reset intent so next message is fresh
+            state["intent"] = ""
             state["bot_response"] = "No problem! Enjoy your trip. 🌟 Ask me anything else anytime."
             return state
 
@@ -301,6 +295,16 @@ class ChatBrain:
         state["travelers"] = state.get("travelers") or travelers
         state["budget_level"] = state.get("budget_level") or budget
 
+        # reject unknown cities for budget too
+        if state.get("city") and not self._is_known_city(state["city"]):
+            state["stage"] = ""
+            state["intent"] = ""
+            state["bot_response"] = (
+                "Sorry, I don't have travel info for that city yet. 😔\n"
+                "Please try another city (for example: Manali, Amritsar, Shimla, Goa)."
+            )
+            return state
+
         if not (state.get("city") and self._has_details(state)):
             if loop < 2:
                 state["stage"] = "bud_await_details"
@@ -311,7 +315,6 @@ class ChatBrain:
                     "number of travelers, and budget level (economy / moderate / luxury)."
                 )
                 return state
-            state["city"] = state.get("city") or "Manali"
             state["days"] = state.get("days") or 3
             state["travelers"] = state.get("travelers") or 2
             state["budget_level"] = state.get("budget_level") or "moderate"
@@ -319,7 +322,6 @@ class ChatBrain:
         return self._do_budget(state)
 
     def _do_budget(self, state):
-        # 🧰 call the LangChain TOOL
         text = estimate_budget.invoke({
             "city": state["city"],
             "days": state["days"],
@@ -327,18 +329,17 @@ class ChatBrain:
             "budget": state["budget_level"],
         })
         state["stage"] = ""
-        state["intent"] = ""              # ⭐ FIX 1: reset intent after budget is done
+        state["intent"] = ""
         state["bot_response"] = text
         return state
 
     # ---------------- QA ----------------
     def qa_node(self, state: ChatState):
-        # 🧰 call the LangChain TOOL
         state["bot_response"] = answer_question.invoke({
             "question": state.get("user_message", ""),
         })
         state["stage"] = ""
-        state["intent"] = ""              # ⭐ FIX 3: reset intent after answering
+        state["intent"] = ""
         return state
 
     # ---------------- small helpers ----------------
@@ -357,6 +358,11 @@ class ChatBrain:
                 return c
         return None
 
-    # ---------------- public entry used by app.py ----------------
+    def _is_known_city(self, city):
+        if not city:
+            return False
+        return city.lower() in [c.lower() for c in self.city_index.all_cities()]
+
+    # ---------------- public entry ----------------
     def handle(self, state: ChatState):
         return self.graph.invoke(state)

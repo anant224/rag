@@ -8,12 +8,11 @@ The "Recommend a place" helper. Two jobs:
 
   2. recommend()           -> plain-Python matching on the CityIndex:
         - filter by region (only if the user gave one)
-        - score each city = how many chosen categories it covers
-        - KEEP ONLY cities that actually match (no zero-match padding)
-        - sort by (match score -> popularity)
-        - return the top 3 cities
-
-The matching is plain Python (NOT RAG) -> reliable and easy to explain.
+        - score each city = HOW MANY of its places match the categories
+          (so a true mountain city with many mountain spots wins over a
+           big city that has just one stray mountain place)
+        - keep only cities that actually match
+        - sort by (score -> popularity), return top 3
 """
 
 import json
@@ -85,24 +84,30 @@ JSON:"""
             if region and info["region"].lower() != region:
                 continue
 
-            overlap = len(set(categories) & info["categories"])
-            scored.append((overlap, info["popularity"], city))
+            # ⭐ score = how MANY places match the chosen categories
+            counts = info["category_counts"]
+            score = sum(counts.get(cat, 0) for cat in categories)
+            scored.append((score, info["popularity"], city))
 
         # if the region filter removed everyone, retry without region
         if not scored:
             for city in self.city_index.all_cities():
                 info = self.city_index.get(city)
-                overlap = len(set(categories) & info["categories"])
-                scored.append((overlap, info["popularity"], city))
+                counts = info["category_counts"]
+                score = sum(counts.get(cat, 0) for cat in categories)
+                scored.append((score, info["popularity"], city))
 
-        # ⭐ KEEP ONLY cities that actually match at least one category
-        #    (this stops non-matching popular cities from padding the list)
+        # KEEP ONLY cities that actually match at least one category
         matches = [s for s in scored if s[0] > 0]
         if matches:
             scored = matches
 
-        # sort by matches, then popularity (both high -> first)
+        # sort by strength of match, then popularity
         scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+        # 🔎 DEBUG — remove these 2 lines once it works
+        # print("USER CATEGORIES:", categories)
+        # print("TOP 5 SCORED:", scored[:5])
 
         return [city for _, _, city in scored[:top_n]]
 

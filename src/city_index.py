@@ -1,14 +1,14 @@
 """
 city_index.py
 -------------
-Builds a small dictionary about every city, used by the RECOMMENDER.
-It is built ONCE from the place + blog documents.
+Builds a dictionary about every city for the RECOMMENDER.
 
 For each city we store:
-  - categories : all categories across that city's places (a set)
-  - region     : e.g. "North India"
-  - popularity : a simple score (number of places + stay minutes)
-  - blog       : the city overview paragraph (from the blog record)
+  - category_counts : {category: how many places have it}  <-- the key change
+  - categories      : the set of categories (kept for reference)
+  - region          : e.g. "North India"
+  - popularity      : simple score (number of places + stay minutes)
+  - blog            : the city overview paragraph
 """
 
 from collections import defaultdict
@@ -20,10 +20,11 @@ class CityIndex:
         self.index = self._build(place_docs, blog_docs)
 
     def _build(self, place_docs, blog_docs):
-        cats = defaultdict(set)     # city -> set of categories
-        region = {}                 # city -> region
-        pop = defaultdict(float)    # city -> popularity number
-        count = defaultdict(int)    # city -> number of places
+        # city -> {category: count of places with that category}
+        cat_counts = defaultdict(lambda: defaultdict(int))
+        region = {}
+        pop = defaultdict(float)
+        count = defaultdict(int)
 
         for doc in place_docs:
             m = doc.metadata
@@ -33,7 +34,7 @@ class CityIndex:
             for c in (m.get("categories") or "").split(","):
                 c = c.strip().lower()
                 if c:
-                    cats[city].add(c)
+                    cat_counts[city][c] += 1     # count how many places have it
             if m.get("region"):
                 region[city] = m.get("region")
             pop[city] += float(m.get("popularity") or 0)
@@ -43,9 +44,10 @@ class CityIndex:
         blogs = {d.metadata.get("city"): d.page_content for d in blog_docs}
 
         index = {}
-        for city in cats:
+        for city in cat_counts:
             index[city] = {
-                "categories": cats[city],
+                "category_counts": dict(cat_counts[city]),
+                "categories": set(cat_counts[city].keys()),
                 "region": region.get(city, ""),
                 "popularity": count[city] * 10 + pop[city] / 100.0,
                 "blog": blogs.get(city, ""),
