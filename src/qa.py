@@ -1,11 +1,9 @@
 """
-qa.py
------
-The "Ask a travel question" helper.
+qa.py  — "Ask a travel question"
 
-RAG-first: semantically search the BLOGS collection in Chroma for the most
-relevant city overviews, then let the LLM answer freely using them.
-If nothing relevant is found, fall back to a general LLM answer.
+Searches the BLOG vectors in Chroma for the most relevant city info,
+then lets Gemini answer in a warm, natural way. If nothing relevant is
+found, it still answers helpfully as a friendly travel guide.
 """
 
 
@@ -22,20 +20,20 @@ class QA:
             context = "\n\n".join(
                 f"City: {d.metadata.get('city')}\n{d.page_content}" for d in docs
             )
-            prompt = f"""You are a friendly travel assistant. Answer the user's question
-using MAINLY the City Information below. If it does not fully cover the question,
-you may add general travel knowledge, but prefer the given info.
+            prompt = f"""You are a warm, friendly travel guide. Answer the traveler's
+question in a natural, conversational way, using MAINLY the City Info below.
+If the info doesn't fully cover it, you may add general travel knowledge.
+Keep it helpful and easy to read (a short, friendly paragraph).
 
-City Information:
+City Info:
 {context}
 
 Question: {question}
 
-Give a helpful, natural answer:"""
+Answer:"""
         else:
-            # fallback: no relevant blog found
-            prompt = f"""You are a friendly travel assistant. Answer this travel
-question helpfully and concisely:
+            prompt = f"""You are a warm, friendly travel guide. Answer this travel
+question in a natural, helpful way (a short, friendly paragraph):
 
 Question: {question}
 

@@ -2,18 +2,18 @@
 budget.py
 ---------
 Rate-based budget estimator (data-independent, always works).
-Per-person-per-day rates by budget tier, scaled by travelers, days,
-and a small per-city factor for hotel + local travel.
+Budget tiers are now: low / medium / high  (easier for users than
+economy/moderate/luxury). We still accept the old words as synonyms.
 """
 
 
 class BudgetEstimator:
 
-    # per-person-per-day rates (INR) -> this IS the economy/moderate/luxury factor
+    # per-person-per-day rates (INR) by budget tier
     RATES = {
-        "economy":  {"hotel": 600,  "food": 500,  "travel": 300,  "activities": 300},
-        "moderate": {"hotel": 1500, "food": 1000, "travel": 500,  "activities": 700},
-        "luxury":   {"hotel": 4000, "food": 2000, "travel": 1200, "activities": 1300},
+        "low":    {"hotel": 800,  "food": 500,  "travel": 300,  "activities": 300},
+        "medium": {"hotel": 2000, "food": 1000, "travel": 600,  "activities": 700},
+        "high":   {"hotel": 5000, "food": 2500, "travel": 1500, "activities": 1500},
     }
 
     # only list cities that differ from baseline (1.0). Unlisted cities = 1.0.
@@ -25,12 +25,26 @@ class BudgetEstimator:
         "Amritsar": 1.0,
     }
 
+    # accept old words too, so nothing breaks
+    SYNONYMS = {
+        "economy": "low", "cheap": "low", "budget": "low",
+        "moderate": "medium", "mid": "medium",
+        "luxury": "high", "premium": "high",
+    }
+
+    def _normalize(self, budget):
+        b = (budget or "medium").lower()
+        b = self.SYNONYMS.get(b, b)     # map synonyms
+        if b not in self.RATES:
+            b = "medium"
+        return b
+
     def get_factor(self, city):
         return self.CITY_FACTOR.get(city, 1.0)
 
     def estimate(self, city, days, travelers, budget):
-        budget = (budget or "moderate").lower()
-        r = self.RATES.get(budget, self.RATES["moderate"])
+        budget = self._normalize(budget)
+        r = self.RATES[budget]
         factor = self.get_factor(city)
         nights = max(1, days - 1)
 
@@ -50,19 +64,21 @@ class BudgetEstimator:
             "activities": round(activities),
             "misc": round(misc),
             "total": round(total),
+            "tier": budget,
         }
 
     def format_budget(self, city, days, travelers, budget, b):
         low = round(b["total"] * 0.9)
         high = round(b["total"] * 1.1)
         return (
-            f"💰 Estimated Budget for {city} ({travelers} travelers, {days} days, {budget})\n"
-            f"- Hotel:            Rs {b['hotel']}\n"
-            f"- Food:             Rs {b['food']}\n"
-            f"- Local Travel:     Rs {b['travel']}\n"
-            f"- Activities:       Rs {b['activities']}\n"
-            f"- Miscellaneous:    Rs {b['misc']}\n"
+            f"💰 Here's an approximate budget for your {b['tier']}-tier trip to {city} "
+            f"({travelers} travelers, {days} days):\n"
+            f"- Hotel:          Rs {b['hotel']}\n"
+            f"- Food:           Rs {b['food']}\n"
+            f"- Local Travel:   Rs {b['travel']}\n"
+            f"- Activities:     Rs {b['activities']}\n"
+            f"- Miscellaneous:  Rs {b['misc']}\n"
             f"------------------------------------\n"
-            f"- Total (approx):   Rs {low} - Rs {high}\n"
-            f"(Approximate estimate, excludes flights.)"
+            f"- Total (approx): Rs {low} - Rs {high}\n\n"
+            f"Just a ballpark to help you plan — it doesn't include flights. 🙂"
         )

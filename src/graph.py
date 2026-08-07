@@ -1,17 +1,12 @@
 """
-graph.py
---------
-The LangGraph routing brain.
+graph.py  — the LangGraph "brain" (routing + conversation flow)
 
-One user message = one graph run. The state is passed in, updated, and
-returned. app.py stores it per session_id -> that is the memory.
-
-FLOW:
-    router --> recommend / itinerary / budget / qa
-
-CITY VALIDATION:
-    We only accept cities that exist in our data. Unknown cities get a
-    polite "try another city" message instead of a broken reply.
+Beginner idea:
+  * One user message = one run of the graph.
+  * We keep a small "state" dict that REMEMBERS the conversation
+    (city, days, travelers, budget, last_city...). app.py stores it per
+    session_id, so the bot remembers you until you refresh / start New Chat.
+  * The router picks ONE of 5 skills: recommend / itinerary / budget / qa / offtopic
 """
 
 import re
@@ -26,7 +21,7 @@ from src.tools import (
 )
 
 
-# ---------- the shared state ----------
+# ---------- the memory that flows through the graph ----------
 class ChatState(TypedDict, total=False):
     user_message: str
     intent: str
@@ -35,6 +30,7 @@ class ChatState(TypedDict, total=False):
     region: str
     recommended_cities: list
     city: str
+    last_city: str          # remembers the city we last talked about
     days: int
     travelers: int
     budget_level: str
@@ -42,9 +38,8 @@ class ChatState(TypedDict, total=False):
     bot_response: str
 
 
-# ---------- small text helpers ----------
-def parse_trip_details(text):
-    """Pull days, travelers, budget level out of a free sentence."""
+# ---------- read trip details out of a sentence ----------
+def parse_details(text):
     t = text.lower()
 
     days = None
@@ -53,17 +48,21 @@ def parse_trip_details(text):
         days = int(m.group(1))
 
     travelers = None
-    m = re.search(r"(\d+)\s*(people|person|traveler|travellers|travelers|pax|adults?)", t)
+    m = re.search(r"(\d+)\s*(people|person|persons|traveler|travelers|traveller|travellers|adult|adults|member|members|pax)", t)
     if m:
         travelers = int(m.group(1))
 
+    # budget words -> low / medium / high (old words still accepted)
     budget = None
-    for b in ["economy", "moderate", "luxury"]:
-        if b in t:
-            budget = b
+    words = {"low": "low", "cheap": "low", "economy": "low",
+             "medium": "medium", "moderate": "medium", "mid": "medium",
+             "high": "high", "luxury": "high", "premium": "high"}
+    for word, tier in words.items():
+        if word in t:
+            budget = tier
             break
 
-    # fallback: two lone numbers -> first = days, second = travelers
+    # if only bare numbers were given, guess: first=days, second=travelers
     if days is None or travelers is None:
         nums = re.findall(r"\d+", t)
         if len(nums) >= 2:
@@ -76,11 +75,9 @@ def parse_trip_details(text):
 
 
 def is_yes(text):
-    return any(w in text.lower() for w in ["yes", "yeah", "yep", "sure", "ok", "please", "haan"])
+    return any(w in text.lower() for w in ["yes", "yeah", "yep", "sure", "ok", "okay", "please", "haan"])
 
 
-# ===========================================================
-#  ChatBrain
 # ===========================================================
 class ChatBrain:
 
@@ -93,37 +90,32 @@ class ChatBrain:
     # ---------------- build the graph ----------------
     def _build_graph(self):
         g = StateGraph(ChatState)
-
         g.add_node("router", self.router_node)
         g.add_node("recommend", self.recommend_node)
         g.add_node("itinerary", self.itinerary_node)
         g.add_node("budget", self.budget_node)
         g.add_node("qa", self.qa_node)
+        g.add_node("offtopic", self.offtopic_node)
 
         g.set_entry_point("router")
-
-        g.add_conditional_edges(
-            "router",
-            self.route_decision,
-            {"recommend": "recommend", "itinerary": "itinerary",
-             "budget": "budget", "qa": "qa"},
-        )
-
-        for node in ["recommend", "itinerary", "budget", "qa"]:
-            g.add_edge(node, END)
-
+        g.add_conditional_edges("router", self.route, {
+            "recommend": "recommend", "itinerary": "itinerary",
+            "budget": "budget", "qa": "qa", "offtopic": "offtopic",
+        })
+        for n in ["recommend", "itinerary", "budget", "qa", "offtopic"]:
+            g.add_edge(n, END)
         return g.compile()
 
     # ---------------- ROUTER ----------------
-    def router_node(self, state: ChatState):
-        if state.get("stage"):
+    def router_node(self, state):
+        if state.get("stage"):                       # already mid-conversation
             return state
         if state.get("intent") in ["recommend", "itinerary", "budget", "qa"]:
-            return state
+            return state                             # a button was clicked
         state["intent"] = self._classify(state.get("user_message", ""))
         return state
 
-    def route_decision(self, state: ChatState):
+    def route(self, state):
         stage = state.get("stage", "")
         if stage.startswith("rec_"):
             return "recommend"
@@ -134,219 +126,248 @@ class ChatBrain:
         return state.get("intent", "qa")
 
     def _classify(self, msg):
-        prompt = f"""Classify the user's travel message into ONE word.
-
-- recommend : ONLY when they ask which CITY or DESTINATION to travel to
-              (e.g. "suggest a place for holidays", "where should I go").
-              Do NOT use this for food spots, things to do, or places WITHIN a city.
-- itinerary : they want a trip plan / day-by-day schedule for a known city.
-- budget    : they want a cost / budget estimate.
-- qa        : ANY other travel question, including food, packing, weather,
-              best time to visit, attractions, tips, or things to do in a city.
+        prompt = f"""You are the router of a TRAVEL assistant.
+Put the message in ONE of these buckets:
+- recommend : wants a city / destination suggestion
+- itinerary : wants a trip plan for a city
+- budget    : wants a trip cost estimate
+- qa        : any travel question (food, weather, attractions, packing, best time...)
+- offtopic  : NOT about travel at all (maths, coding, jokes, general chit-chat...)
 
 Message: "{msg}"
-Answer with only one word (recommend/itinerary/budget/qa):"""
+Answer with only one word:"""
         out = self.generator.generate(prompt).strip().lower()
-        for key in ["recommend", "itinerary", "budget", "qa"]:
-            if key in out:
-                return key
+        for k in ["recommend", "itinerary", "budget", "qa", "offtopic"]:
+            if k in out:
+                return k
         return "qa"
 
+    # ---------------- OFF-TOPIC (politely decline) ----------------
+    def offtopic_node(self, state):
+        state.update(stage="", intent="")
+        state["bot_response"] = (
+            "Ah, that's a little outside my world! 🙂 I'm your travel buddy, so I help with "
+            "destinations, trip plans, budgets and travel questions.\n"
+            "Try me with something like \"suggest a mountain trip\" or \"plan 3 days in Goa\"."
+        )
+        return state
+
     # ---------------- RECOMMEND ----------------
-    def recommend_node(self, state: ChatState):
+    def recommend_node(self, state):
         stage = state.get("stage", "")
         msg = state.get("user_message", "")
         loop = state.get("loop_count", 0)
 
-        # user is picking one of the 3 suggested cities
+        # user is choosing one of the 3 suggested cities
         if stage == "rec_await_city_choice":
-            city = self._match_city(msg, state.get("recommended_cities", []))
+            city = self._match(msg, state.get("recommended_cities", []))
             if city:
-                state["city"] = city
-                state["stage"] = "itin_await_details"
-                state["intent"] = "itinerary"
-                state["loop_count"] = 0
-                state["bot_response"] = (
-                    f"Great choice — {city}! ✨\n\n"
-                    "To build your itinerary, tell me:\n"
-                    "• How many days?\n• How many travelers?\n"
-                    "• Budget level (economy / moderate / luxury)?"
-                )
+                state.update(city=city, last_city=city, stage="itin_await_details",
+                             intent="itinerary", loop_count=0)
+                self._absorb(state, msg)
+                state["bot_response"] = self._ask_missing(state, f"Great pick — {city}! 🎉")
             else:
-                state["bot_response"] = "Please pick one of the suggested cities by typing its name. 🙂"
+                state["bot_response"] = "Just type one of the cities I suggested and we'll take it from there. 🙂"
             return state
 
-        # fresh recommend OR an answer to "what kind of trip?"
+        # figure out what kind of trip they like
         cats, region = self.recommender.extract_preferences(msg)
         if region:
             state["region"] = region
         if cats:
             state["categories"] = cats
 
-        # not enough info yet -> ask once (max 2 loops)
         if not state.get("categories") and loop < 2:
-            state["stage"] = "rec_await_categories"
-            state["loop_count"] = loop + 1
-            state["intent"] = "recommend"
+            state.update(stage="rec_await_categories", loop_count=loop + 1, intent="recommend")
             state["bot_response"] = (
-                "I'd love to help! What kind of trip do you enjoy? 🌍\n"
-                "(mountains, beaches, religious, heritage, adventure, rivers, party)\n"
-                "You can also tell me a region of India if you have one in mind."
+                "Love it! What kind of trip are you in the mood for? 🌍\n"
+                "(mountains, beaches, temples, history, adventure, rivers, or nightlife)"
             )
             return state
 
-        # 2 loops done -> auto-fill
         if not state.get("categories"):
             state["categories"] = self.recommender.auto_fill_categories()
 
         cities = recommend_places.invoke({
-            "categories": state["categories"],
-            "region": state.get("region", ""),
+            "categories": state["categories"], "region": state.get("region", ""),
         })
-        state["recommended_cities"] = cities
-        state["stage"] = "rec_await_city_choice"
+        state.update(recommended_cities=cities, stage="rec_await_city_choice")
         state["bot_response"] = self.recommender.format_recommendations(cities)
         return state
 
     # ---------------- ITINERARY ----------------
-    def itinerary_node(self, state: ChatState):
+    def itinerary_node(self, state):
         stage = state.get("stage", "")
         msg = state.get("user_message", "")
         loop = state.get("loop_count", 0)
 
-        # we don't know the city yet -> ask
+        # did the user name a city in THIS message?
+        mentioned = self._mentions_a_city(msg)
+        if mentioned == "unknown":
+            # they named a city we don't have (e.g. Lahore) -> decline politely
+            state.update(stage="", intent="")
+            state["bot_response"] = self._unknown_city_msg()
+            return state
+        if mentioned:
+            # a known city -> use it (overrides any old remembered city)
+            state.update(city=mentioned, last_city=mentioned)
+
+        # no city yet -> ask for it
         if not state.get("city") and stage != "itin_await_city":
-            state["stage"] = "itin_await_city"
-            state["intent"] = "itinerary"
-            state["bot_response"] = "Which city would you like a trip plan for? 🗺️"
+            state.update(stage="itin_await_city", intent="itinerary")
+            state["bot_response"] = "Awesome! Which city are you thinking of? 🗺️"
             return state
 
-        # user typed a city -> VALIDATE it against our data
+        # they typed a city -> check it exists in our data
         if stage == "itin_await_city":
-            found = self._extract_city(msg)
-            if not found:
-                state["bot_response"] = (
-                    "Sorry, I don't have travel info for that city yet. 😔\n"
-                    "Please try another city (for example: Manali, Amritsar, Shimla, Goa)."
-                )
+            city = self._extract_city(msg)
+            if not city:
+                state["bot_response"] = self._unknown_city_msg()
                 return state
-            state["city"] = found
-            state["stage"] = "itin_await_details"
-            state["bot_response"] = (
-                f"{found} it is! How many days, how many travelers, "
-                "and which budget (economy / moderate / luxury)?"
-            )
+            state.update(city=city, last_city=city, stage="itin_await_details")
+            self._absorb(state, msg)                       # grab any details they gave too
+            state["bot_response"] = self._ask_missing(state, f"{city} — lovely choice! 🎉")
             return state
 
-        # gather days / travelers / budget
-        if stage == "itin_await_details" or not self._has_details(state):
-            days, travelers, budget = parse_trip_details(msg)
-            state["days"] = state.get("days") or days
-            state["travelers"] = state.get("travelers") or travelers
-            state["budget_level"] = state.get("budget_level") or budget
-
-            if not self._has_details(state):
+        # collect days / travelers / budget (only ask for what's missing)
+        if stage == "itin_await_details" or not self._have_all(state):
+            self._absorb(state, msg)
+            if not self._have_all(state):
                 if loop < 2:
-                    state["stage"] = "itin_await_details"
-                    state["loop_count"] = loop + 1
-                    state["bot_response"] = (
-                        "Got it! Please share the missing bits — number of days, "
-                        "number of travelers, and budget (economy / moderate / luxury)."
-                    )
+                    state.update(stage="itin_await_details", loop_count=loop + 1)
+                    state["bot_response"] = self._ask_missing(state)
                     return state
-                state["days"] = state.get("days") or 3
-                state["travelers"] = state.get("travelers") or 2
-                state["budget_level"] = state.get("budget_level") or "moderate"
+                state.setdefault("days", 3)
+                state.setdefault("travelers", 2)
+                state.setdefault("budget_level", "medium")
 
-        # build the itinerary
         itinerary = plan_itinerary.invoke({
-            "city": state["city"],
-            "days": state["days"],
-            "travelers": state["travelers"],
-            "budget": state["budget_level"],
-            "categories": state.get("categories") or [],
+            "city": state["city"], "days": state["days"], "travelers": state["travelers"],
+            "budget": state["budget_level"], "categories": state.get("categories") or [],
         })
-        state["stage"] = "bud_await_budget_offer"
-        state["intent"] = "budget"
-        state["loop_count"] = 0
-        state["bot_response"] = itinerary + "\n\nWould you like a budget estimate for this trip? (yes / no)"
+        state.update(stage="bud_offer", intent="budget", loop_count=0, last_city=state["city"])
+        state["bot_response"] = itinerary + "\n\nWant me to estimate a budget for this trip too? (yes / no)"
         return state
 
     # ---------------- BUDGET ----------------
-    def budget_node(self, state: ChatState):
+    def budget_node(self, state):
         stage = state.get("stage", "")
         msg = state.get("user_message", "")
         loop = state.get("loop_count", 0)
 
-        # offered after an itinerary
-        if stage == "bud_await_budget_offer":
+        # we offered a budget after the itinerary
+        if stage == "bud_offer":
             if is_yes(msg):
                 return self._do_budget(state)
-            state["stage"] = ""
-            state["intent"] = ""
-            state["bot_response"] = "No problem! Enjoy your trip. 🌟 Ask me anything else anytime."
+            state.update(stage="", intent="")
+            state["bot_response"] = "No worries — have an amazing trip! 🌟 I'm here whenever you need me."
             return state
 
-        # standalone budget: gather city + details
-        days, travelers, budget = parse_trip_details(msg)
+        # standalone budget request -> read city + details from the message
         city = self._extract_city(msg)
-        state["city"] = state.get("city") or city
-        state["days"] = state.get("days") or days
-        state["travelers"] = state.get("travelers") or travelers
-        state["budget_level"] = state.get("budget_level") or budget
+        if city:
+            state.update(city=city, last_city=city)
+        self._absorb(state, msg)
 
-        # reject unknown cities for budget too
-        if state.get("city") and not self._is_known_city(state["city"]):
-            state["stage"] = ""
-            state["intent"] = ""
-            state["bot_response"] = (
-                "Sorry, I don't have travel info for that city yet. 😔\n"
-                "Please try another city (for example: Manali, Amritsar, Shimla, Goa)."
-            )
+        # they named a city we don't have
+        if state.get("city") and not self._known(state["city"]):
+            state.update(stage="", intent="")
+            state["bot_response"] = self._unknown_city_msg()
             return state
 
-        if not (state.get("city") and self._has_details(state)):
+        # still missing city or details -> ask only for what's missing (max 2 times)
+        if not state.get("city") or not self._have_all(state):
             if loop < 2:
-                state["stage"] = "bud_await_details"
-                state["loop_count"] = loop + 1
-                state["intent"] = "budget"
-                state["bot_response"] = (
-                    "Sure! For a budget estimate, tell me the city, number of days, "
-                    "number of travelers, and budget level (economy / moderate / luxury)."
-                )
+                bits = []
+                if not state.get("city"):
+                    bits.append("which city")
+                if not state.get("days"):
+                    bits.append("how many days")
+                if not state.get("travelers"):
+                    bits.append("how many travelers")
+                if not state.get("budget_level"):
+                    bits.append("budget (low / medium / high)")
+                state.update(stage="bud_await", loop_count=loop + 1, intent="budget")
+                state["bot_response"] = "Happy to estimate! Could you tell me " + self._join(bits) + "?"
                 return state
-            state["days"] = state.get("days") or 3
-            state["travelers"] = state.get("travelers") or 2
-            state["budget_level"] = state.get("budget_level") or "moderate"
+            # after 2 tries, fill sensible defaults (but a city is still required)
+            state.setdefault("days", 3)
+            state.setdefault("travelers", 2)
+            state.setdefault("budget_level", "medium")
+            if not state.get("city"):
+                state.update(stage="", intent="")
+                state["bot_response"] = "I still need a city for the estimate. " + self._unknown_city_msg()
+                return state
 
         return self._do_budget(state)
 
     def _do_budget(self, state):
         text = estimate_budget.invoke({
-            "city": state["city"],
-            "days": state["days"],
-            "travelers": state["travelers"],
-            "budget": state["budget_level"],
+            "city": state["city"], "days": state["days"],
+            "travelers": state["travelers"], "budget": state["budget_level"],
         })
-        state["stage"] = ""
-        state["intent"] = ""
+        state.update(stage="", intent="")
         state["bot_response"] = text
         return state
 
-    # ---------------- QA ----------------
-    def qa_node(self, state: ChatState):
-        state["bot_response"] = answer_question.invoke({
-            "question": state.get("user_message", ""),
-        })
-        state["stage"] = ""
-        state["intent"] = ""
+    # ---------------- QA (remembers the last city) ----------------
+    def qa_node(self, state):
+        msg = state.get("user_message", "")
+        city = self._extract_city(msg)
+        if city:
+            state["last_city"] = city               # remember it for follow-ups
+            question = msg
+        elif state.get("last_city"):
+            # follow-up like "best place to eat there" -> attach remembered city
+            question = f"{msg} (the user is asking about {state['last_city']})"
+        else:
+            question = msg
+        state["bot_response"] = answer_question.invoke({"question": question})
+        state.update(stage="", intent="")
         return state
 
     # ---------------- small helpers ----------------
-    def _has_details(self, state):
+    def _absorb(self, state, msg):
+        d, t, b = parse_details(msg)
+        if d and not state.get("days"):
+            state["days"] = d
+        if t and not state.get("travelers"):
+            state["travelers"] = t
+        if b and not state.get("budget_level"):
+            state["budget_level"] = b
+
+    def _have_all(self, state):
         return bool(state.get("days") and state.get("travelers") and state.get("budget_level"))
 
-    def _match_city(self, msg, options):
+    def _ask_missing(self, state, opening=""):
+        need = []
+        if not state.get("days"):
+            need.append("how many days")
+        if not state.get("travelers"):
+            need.append("how many travelers")
+        if not state.get("budget_level"):
+            need.append("your budget (low / medium / high)")
+        text = "Could you tell me " + self._join(need) + "?"
+        return (opening + "\n\n" + text) if opening else text
+
+    def _join(self, items):
+        if not items:
+            return ""
+        if len(items) == 1:
+            return items[0]
+        if len(items) == 2:
+            return items[0] + " and " + items[1]
+        return ", ".join(items[:-1]) + ", and " + items[-1]
+
+    def _unknown_city_msg(self):
+        sample = ", ".join(self.city_index.all_cities()[:6])
+        return (
+            "Ah, we're still adding that city to our travel database — it should be there soon! 🙏\n"
+            f"For now I can plan a wonderful trip to places like: {sample}.\n"
+            "Which one would you like?"
+        )
+
+    def _match(self, msg, options):
         for c in options:
             if c.lower() in msg.lower():
                 return c
@@ -358,11 +379,25 @@ Answer with only one word (recommend/itinerary/budget/qa):"""
                 return c
         return None
 
-    def _is_known_city(self, city):
-        if not city:
-            return False
-        return city.lower() in [c.lower() for c in self.city_index.all_cities()]
+    def _mentions_a_city(self, msg):
+        """Return a known city if named, 'unknown' if the user clearly asks
+        for a trip to some place we don't have, or None otherwise."""
+        # is a KNOWN city named?
+        known = self._extract_city(msg)
+        if known:
+            return known
+        # do they clearly want a trip for a place, but it's not in our data?
+        trip_words = ["itinerary", "trip", "plan", "visit", "go to", " for "]
+        if any(w in msg.lower() for w in trip_words):
+            # a capitalized place-like word we don't recognize?
+            names = [w.strip(",.?!") for w in msg.split() if w[:1].isupper()]
+            if names:
+                return "unknown"
+        return None
 
-    # ---------------- public entry ----------------
-    def handle(self, state: ChatState):
+    def _known(self, city):
+        return bool(city) and city.lower() in [c.lower() for c in self.city_index.all_cities()]
+
+    # ---------------- public entry (used by app.py) ----------------
+    def handle(self, state):
         return self.graph.invoke(state)
