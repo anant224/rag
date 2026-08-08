@@ -1,12 +1,14 @@
 """
 graph.py  — the LangGraph "brain" (routing + conversation flow)
 
-Beginner idea:
-  * One user message = one run of the graph.
-  * We keep a small "state" dict that REMEMBERS the conversation
-    (city, days, travelers, budget, last_city...). app.py stores it per
-    session_id, so the bot remembers you until you refresh / start New Chat.
-  * The router picks ONE of 5 skills: recommend / itinerary / budget / qa / offtopic
+Rules:
+  * Mid-task, we deterministically check if the message ANSWERS the current
+    question. If yes -> continue. If it's a new request/question -> switch.
+  * Chit-chat ("hey") inside a flow re-asks the question (does not abandon it).
+  * A NEW city clears the previous trip's days/travelers/budget (no stale data).
+  * Numbers are VALIDATED (no negative / zero / huge days or travelers) and a
+    final safety guard means a bad number can NEVER generate a trip.
+  * We never assume inputs; we keep asking only for what's missing (no limit).
 """
 
 import re
@@ -30,52 +32,62 @@ class ChatState(TypedDict, total=False):
     region: str
     recommended_cities: list
     city: str
-    last_city: str          # remembers the city we last talked about
+    last_city: str
     days: int
     travelers: int
     budget_level: str
-    loop_count: int
     bot_response: str
 
 
-# ---------- read trip details out of a sentence ----------
+# ---------- read numbers/budget out of a sentence ----------
 def parse_details(text):
     t = text.lower()
 
     days = None
-    m = re.search(r"(\d+)\s*day", t)
+    m = re.search(r"(-?\d+)\s*day", t)
     if m:
         days = int(m.group(1))
 
     travelers = None
-    m = re.search(r"(\d+)\s*(people|person|persons|traveler|travelers|traveller|travellers|adult|adults|member|members|pax)", t)
+    m = re.search(r"(-?\d+)\s*(people|person|persons|traveler|travelers|traveller|travellers|adult|adults|member|members|pax)", t)
     if m:
         travelers = int(m.group(1))
 
-    # budget words -> low / medium / high (old words still accepted)
     budget = None
     words = {"low": "low", "cheap": "low", "economy": "low",
              "medium": "medium", "moderate": "medium", "mid": "medium",
-             "high": "high", "luxury": "high", "premium": "high"}
+             "high": "high", "luxury": "high", "premium": "high", "good": "high"}
     for word, tier in words.items():
         if word in t:
             budget = tier
             break
 
-    # if only bare numbers were given, guess: first=days, second=travelers
-    if days is None or travelers is None:
-        nums = re.findall(r"\d+", t)
+    if days is None and travelers is None:
+        nums = re.findall(r"-?\d+", t)
         if len(nums) >= 2:
-            days = days or int(nums[0])
-            travelers = travelers or int(nums[1])
-        elif len(nums) == 1 and days is None:
+            days = int(nums[0])
+            travelers = int(nums[1])
+        elif len(nums) == 1:
             days = int(nums[0])
 
     return days, travelers, budget
 
 
 def is_yes(text):
-    return any(w in text.lower() for w in ["yes", "yeah", "yep", "sure", "ok", "okay", "please", "haan"])
+    return any(w in text.lower() for w in ["yes", "yeah", "yep", "sure", "ok", "okay", "please", "haan", "yup", "go ahead"])
+
+
+def is_plain_no(text):
+    return text.lower().strip().strip(".!") in ("no", "nope", "no thanks", "no thank you", "not now", "nah")
+
+
+def looks_like_question(text):
+    t = text.lower().strip()
+    if t.endswith("?"):
+        return True
+    starters = ("where ", "what ", "how ", "which ", "can ", "could ", "is ",
+                "are ", "do ", "does ", "any ", "when ", "who ", "why ", "tell me")
+    return t.startswith(starters)
 
 
 # ===========================================================
@@ -106,16 +118,25 @@ class ChatBrain:
             g.add_edge(n, END)
         return g.compile()
 
-    # ---------------- ROUTER ----------------
+    # ================= ROUTER =================
     def router_node(self, state):
-        if state.get("stage"):                       # already mid-conversation
+        msg = state.get("user_message", "")
+        stage = state.get("stage", "")
+
+        if not stage and state.get("intent") in ["recommend", "itinerary", "budget", "qa"]:
             return state
-        if state.get("intent") in ["recommend", "itinerary", "budget", "qa"]:
-            return state                             # a button was clicked
-        state["intent"] = self._classify(state.get("user_message", ""))
+
+        if stage and self._answers_current(state, msg):
+            return state
+
+        if stage:
+            self._reset_task(state)
+        state["intent"] = self._classify(msg)
         return state
 
     def route(self, state):
+        if state.get("intent") == "offtopic":
+            return "offtopic"
         stage = state.get("stage", "")
         if stage.startswith("rec_"):
             return "recommend"
@@ -125,183 +146,273 @@ class ChatBrain:
             return "budget"
         return state.get("intent", "qa")
 
-    def _classify(self, msg):
-        prompt = f"""You are the router of a TRAVEL assistant.
-Put the message in ONE of these buckets:
-- recommend : wants a city / destination suggestion
-- itinerary : wants a trip plan for a city
-- budget    : wants a trip cost estimate
-- qa        : any travel question (food, weather, attractions, packing, best time...)
-- offtopic  : NOT about travel at all (maths, coding, jokes, general chit-chat...)
+    # ---- deterministic: does the message answer the current question? ----
+    def _answers_current(self, state, msg):
+        stage = state.get("stage", "")
 
-Message: "{msg}"
-Answer with only one word:"""
+        if stage == "rec_await_categories":
+            cats, _ = self.recommender.extract_preferences(msg)
+            if cats:
+                return True
+            return not self._is_new_request(msg)
+
+        if stage == "rec_await_city_choice":
+            if self._find_known_city(msg) or self._match(msg, state.get("recommended_cities", [])):
+                return True
+            cats, _ = self.recommender.extract_preferences(msg)
+            if cats:
+                return True
+            return not self._is_new_request(msg)
+
+        if stage == "itin_await_city":
+            if self._find_known_city(msg):
+                return True
+            if self._is_new_request(msg):
+                return False
+            return not looks_like_question(msg) and len(msg.split()) <= 4
+
+        if stage in ("itin_await_details", "bud_await"):
+            if looks_like_question(msg) and not self._find_known_city(msg):
+                d0, t0, b0 = parse_details(msg)
+                if d0 is None and t0 is None and not b0:
+                    return False        # it's a real question, switch to QA
+            d, t, b = parse_details(msg)
+            if d is not None or t is not None or b:
+                return True
+            return bool(re.fullmatch(r"-?\d+", msg.strip()))
+
+        if stage == "bud_offer":
+            low = msg.lower()
+            if is_yes(msg) or any(w in low for w in ["budget", "cost", "estimate", "how much"]):
+                return True
+            if is_plain_no(msg):
+                return True
+            return False
+
+        return False
+
+    def _is_new_request(self, msg):
+        low = msg.lower().strip()
+        if low in ("hi", "hey", "hello", "yo", "hmm", "ok", "okay", "cool", "thanks"):
+            return False
+        if looks_like_question(msg):
+            return True
+        if any(w in low for w in ["plan", "itinerary", "budget", "cost", "how much", "recommend", "suggest"]):
+            return True
+        return False
+
+    def _classify(self, msg):
+        prompt = f"""You are the intent router for a friendly TRAVEL assistant.
+
+The user said: "{msg}"
+
+Choose exactly ONE label:
+- recommend : wants a CITY / DESTINATION suggestion to travel to
+              ("where should I go", "suggest a place for holidays", "plan a trip for me")
+- itinerary : wants a day-by-day trip PLAN for a place ("plan 3 days in Goa")
+- budget    : wants a trip COST estimate ("how much for a Goa trip")
+- qa        : ANY travel question or info request, INCLUDING flights, hotels,
+              restaurants, nearby places, weather, packing, best time, safety,
+              or "tell me about <place>"
+- offtopic  : NOT about travel at all (maths, coding, jokes, greetings like "hi")
+
+RULES:
+- Questions about flights, hotels, food, or "nearby city" are always "qa".
+- A plain greeting like "hi"/"hey" with no travel request is "offtopic".
+- If unsure, prefer "qa".
+
+Answer with only ONE word:"""
         out = self.generator.generate(prompt).strip().lower()
         for k in ["recommend", "itinerary", "budget", "qa", "offtopic"]:
             if k in out:
                 return k
         return "qa"
 
-    # ---------------- OFF-TOPIC (politely decline) ----------------
+    # ================= OFF-TOPIC =================
     def offtopic_node(self, state):
         state.update(stage="", intent="")
         state["bot_response"] = (
-            "Ah, that's a little outside my world! 🙂 I'm your travel buddy, so I help with "
-            "destinations, trip plans, budgets and travel questions.\n"
+            "I'm your travel buddy, so I stick to travel! 🙂 I can recommend destinations, "
+            "plan itineraries, estimate budgets, or answer travel questions.\n"
             "Try me with something like \"suggest a mountain trip\" or \"plan 3 days in Goa\"."
         )
         return state
 
-    # ---------------- RECOMMEND ----------------
+    # ================= RECOMMEND =================
     def recommend_node(self, state):
         stage = state.get("stage", "")
         msg = state.get("user_message", "")
-        loop = state.get("loop_count", 0)
 
-        # user is choosing one of the 3 suggested cities
         if stage == "rec_await_city_choice":
-            city = self._match(msg, state.get("recommended_cities", []))
-            if city:
-                state.update(city=city, last_city=city, stage="itin_await_details",
-                             intent="itinerary", loop_count=0)
-                self._absorb(state, msg)
-                state["bot_response"] = self._ask_missing(state, f"Great pick — {city}! 🎉")
-            else:
-                state["bot_response"] = "Just type one of the cities I suggested and we'll take it from there. 🙂"
+            city = self._match(msg, state.get("recommended_cities", [])) or self._find_known_city(msg)
+            if city and self._known(city):
+                self._set_city(state, city)
+                state.update(stage="itin_await_details", intent="itinerary")
+                err = self._absorb_validated(state, msg)
+                if err:
+                    state["bot_response"] = err
+                    return state
+                if self._have_all(state):
+                    return self._generate_itinerary(state)
+                state["bot_response"] = self._ask_missing(state, self._city_ack(city))
+                return state
+
+            cats, region = self.recommender.extract_preferences(msg)
+            if cats:
+                state["categories"] = cats
+                if region:
+                    state["region"] = region
+                return self._make_recommendations(state)
+
+            state["bot_response"] = (
+                "Just tell me which of those cities you'd like, or a different kind of trip "
+                "(mountains, beaches, temples, history, adventure, rivers, nightlife). 🙂"
+            )
             return state
 
-        # figure out what kind of trip they like
         cats, region = self.recommender.extract_preferences(msg)
         if region:
             state["region"] = region
         if cats:
             state["categories"] = cats
 
-        if not state.get("categories") and loop < 2:
-            state.update(stage="rec_await_categories", loop_count=loop + 1, intent="recommend")
+        if not state.get("categories"):
+            state.update(stage="rec_await_categories", intent="recommend")
             state["bot_response"] = (
-                "Love it! What kind of trip are you in the mood for? 🌍\n"
+                "Sure! Just tell me what kind of trip you're in the mood for. 🌍\n"
                 "(mountains, beaches, temples, history, adventure, rivers, or nightlife)"
             )
             return state
 
-        if not state.get("categories"):
-            state["categories"] = self.recommender.auto_fill_categories()
+        return self._make_recommendations(state)
 
+    def _make_recommendations(self, state):
         cities = recommend_places.invoke({
             "categories": state["categories"], "region": state.get("region", ""),
         })
-        state.update(recommended_cities=cities, stage="rec_await_city_choice")
+        state.update(recommended_cities=cities, stage="rec_await_city_choice", intent="recommend")
         state["bot_response"] = self.recommender.format_recommendations(cities)
         return state
 
-    # ---------------- ITINERARY ----------------
+    # ================= ITINERARY =================
     def itinerary_node(self, state):
-        stage = state.get("stage", "")
         msg = state.get("user_message", "")
-        loop = state.get("loop_count", 0)
 
-        # did the user name a city in THIS message?
-        mentioned = self._mentions_a_city(msg)
-        if mentioned == "unknown":
-            # they named a city we don't have (e.g. Lahore) -> decline politely
-            state.update(stage="", intent="")
+    def itinerary_node(self, state):
+        msg = state.get("user_message", "")
+
+        # fresh "plan a trip" request (not mid-details) -> clear old trip data
+        if state.get("stage", "") not in ("itin_await_city", "itin_await_details"):
+            for k in ["days", "travelers", "budget_level"]:
+                state.pop(k, None)
+
+        dest = self._destination(state, msg)
+
+        dest = self._destination(state, msg)
+        if isinstance(dest, tuple):
+            self._reset_task(state)
             state["bot_response"] = self._unknown_city_msg()
             return state
-        if mentioned:
-            # a known city -> use it (overrides any old remembered city)
-            state.update(city=mentioned, last_city=mentioned)
+        if dest:
+            self._set_city(state, dest)
 
-        # no city yet -> ask for it
-        if not state.get("city") and stage != "itin_await_city":
+        if not state.get("city"):
             state.update(stage="itin_await_city", intent="itinerary")
-            state["bot_response"] = "Awesome! Which city are you thinking of? 🗺️"
+            state["bot_response"] = "Awesome! Which city would you like to explore? 🗺️"
             return state
 
-        # they typed a city -> check it exists in our data
-        if stage == "itin_await_city":
-            city = self._extract_city(msg)
-            if not city:
-                state["bot_response"] = self._unknown_city_msg()
-                return state
-            state.update(city=city, last_city=city, stage="itin_await_details")
-            self._absorb(state, msg)                       # grab any details they gave too
-            state["bot_response"] = self._ask_missing(state, f"{city} — lovely choice! 🎉")
+        err = self._absorb_validated(state, msg)
+        if err:
+            state.update(stage="itin_await_details", intent="itinerary")
+            state["bot_response"] = err
             return state
 
-        # collect days / travelers / budget (only ask for what's missing)
-        if stage == "itin_await_details" or not self._have_all(state):
-            self._absorb(state, msg)
-            if not self._have_all(state):
-                if loop < 2:
-                    state.update(stage="itin_await_details", loop_count=loop + 1)
-                    state["bot_response"] = self._ask_missing(state)
-                    return state
-                state.setdefault("days", 3)
-                state.setdefault("travelers", 2)
-                state.setdefault("budget_level", "medium")
+        if not self._have_all(state):
+            ack = self._city_ack(state["city"]) if dest else ""
+            state.update(stage="itin_await_details", intent="itinerary")
+            state["bot_response"] = self._ask_missing(state, ack)
+            return state
+
+        return self._generate_itinerary(state)
+
+    def _generate_itinerary(self, state):
+        # SAFETY GUARD: never generate with invalid numbers
+        if not self._valid(state.get("days"), 1, 30):
+            state.pop("days", None)
+        if not self._valid(state.get("travelers"), 1, 50):
+            state.pop("travelers", None)
+        if not self._have_all(state):
+            state.update(stage="itin_await_details", intent="itinerary")
+            state["bot_response"] = self._ask_missing(state, "Let's just confirm the details 🙂")
+            return state
 
         itinerary = plan_itinerary.invoke({
             "city": state["city"], "days": state["days"], "travelers": state["travelers"],
             "budget": state["budget_level"], "categories": state.get("categories") or [],
         })
-        state.update(stage="bud_offer", intent="budget", loop_count=0, last_city=state["city"])
+        state.update(stage="bud_offer", intent="budget", last_city=state["city"])
         state["bot_response"] = itinerary + "\n\nWant me to estimate a budget for this trip too? (yes / no)"
         return state
 
-    # ---------------- BUDGET ----------------
+    # ================= BUDGET =================
     def budget_node(self, state):
         stage = state.get("stage", "")
         msg = state.get("user_message", "")
-        loop = state.get("loop_count", 0)
 
-        # we offered a budget after the itinerary
         if stage == "bud_offer":
-            if is_yes(msg):
+            low = msg.lower()
+            wants = is_yes(msg) or any(w in low for w in ["budget", "cost", "estimate", "how much"])
+            if wants:
                 return self._do_budget(state)
             state.update(stage="", intent="")
             state["bot_response"] = "No worries — have an amazing trip! 🌟 I'm here whenever you need me."
             return state
+        
+                
 
-        # standalone budget request -> read city + details from the message
-        city = self._extract_city(msg)
-        if city:
-            state.update(city=city, last_city=city)
-        self._absorb(state, msg)
+        # fresh standalone budget request -> clear old trip data
+        if stage not in ("bud_await", "bud_offer"):
+            for k in ["days", "travelers", "budget_level"]:
+                state.pop(k, None)
 
-        # they named a city we don't have
-        if state.get("city") and not self._known(state["city"]):
-            state.update(stage="", intent="")
+
+        dest = self._destination(state, msg)
+        if isinstance(dest, tuple):
+            self._reset_task(state)
             state["bot_response"] = self._unknown_city_msg()
             return state
+        if dest:
+            self._set_city(state, dest)
 
-        # still missing city or details -> ask only for what's missing (max 2 times)
-        if not state.get("city") or not self._have_all(state):
-            if loop < 2:
-                bits = []
-                if not state.get("city"):
-                    bits.append("which city")
-                if not state.get("days"):
-                    bits.append("how many days")
-                if not state.get("travelers"):
-                    bits.append("how many travelers")
-                if not state.get("budget_level"):
-                    bits.append("budget (low / medium / high)")
-                state.update(stage="bud_await", loop_count=loop + 1, intent="budget")
-                state["bot_response"] = "Happy to estimate! Could you tell me " + self._join(bits) + "?"
-                return state
-            # after 2 tries, fill sensible defaults (but a city is still required)
-            state.setdefault("days", 3)
-            state.setdefault("travelers", 2)
-            state.setdefault("budget_level", "medium")
-            if not state.get("city"):
-                state.update(stage="", intent="")
-                state["bot_response"] = "I still need a city for the estimate. " + self._unknown_city_msg()
-                return state
+        if not state.get("city"):
+            state.update(stage="bud_await", intent="budget")
+            state["bot_response"] = "Sure! Which city is the trip for? 🙂"
+            return state
+
+        err = self._absorb_validated(state, msg)
+        if err:
+            state.update(stage="bud_await", intent="budget")
+            state["bot_response"] = err
+            return state
+
+        if not self._have_all(state):
+            state.update(stage="bud_await", intent="budget")
+            state["bot_response"] = self._ask_missing(state)
+            return state
 
         return self._do_budget(state)
 
     def _do_budget(self, state):
+        # SAFETY GUARD: never estimate with invalid numbers
+        if not self._valid(state.get("days"), 1, 30):
+            state.pop("days", None)
+        if not self._valid(state.get("travelers"), 1, 50):
+            state.pop("travelers", None)
+        if not self._have_all(state):
+            state.update(stage="bud_await", intent="budget")
+            state["bot_response"] = self._ask_missing(state, "Let's just confirm the details 🙂")
+            return state
+
         text = estimate_budget.invoke({
             "city": state["city"], "days": state["days"],
             "travelers": state["travelers"], "budget": state["budget_level"],
@@ -310,31 +421,81 @@ Answer with only one word:"""
         state["bot_response"] = text
         return state
 
-    # ---------------- QA (remembers the last city) ----------------
+    # ================= QA =================
     def qa_node(self, state):
         msg = state.get("user_message", "")
-        city = self._extract_city(msg)
+
+        if self._is_generic_opener(msg):
+            state.update(stage="", intent="")
+            state["bot_response"] = (
+                "Of course! 😊 What would you like to know? You can ask me about a "
+                "destination, the best time to visit, local food, packing tips, and more."
+            )
+            return state
+
+        city = self._find_known_city(msg)
         if city:
-            state["last_city"] = city               # remember it for follow-ups
+            state["last_city"] = city
             question = msg
-        elif state.get("last_city"):
-            # follow-up like "best place to eat there" -> attach remembered city
-            question = f"{msg} (the user is asking about {state['last_city']})"
+        elif state.get("last_city") and any(w in f" {msg.lower()} " for w in
+                                            [" there ", " here ", " that place ", " same place ",
+                                             " this place ", " it ", " its "]):
+            question = f"{msg} (the user is referring to {state['last_city']})"
         else:
             question = msg
+
         state["bot_response"] = answer_question.invoke({"question": question})
         state.update(stage="", intent="")
         return state
 
-    # ---------------- small helpers ----------------
-    def _absorb(self, state, msg):
+    # ================= input reading + validation =================
+    def _absorb_validated(self, state, msg):
+        text = msg.strip()
+
+        # lone number answers the ONE numeric field still missing
+        m = re.fullmatch(r"-?\d+", text)
+        if m:
+            n = int(m.group())
+            missing = [f for f in ["days", "travelers"] if not state.get(f)]
+            if len(missing) == 1:
+                return self._set_number(state, missing[0], n)
+            if "days" in missing:
+                return self._set_number(state, "days", n)
+
         d, t, b = parse_details(msg)
-        if d and not state.get("days"):
-            state["days"] = d
-        if t and not state.get("travelers"):
-            state["travelers"] = t
+
+        # validate even if a value is already set (so "-3 days" is always caught)
+        if d is not None:
+            err = self._set_number(state, "days", d, force=True)
+            if err:
+                return err
+        if t is not None:
+            err = self._set_number(state, "travelers", t, force=True)
+            if err:
+                return err
         if b and not state.get("budget_level"):
             state["budget_level"] = b
+        return None
+
+    def _set_number(self, state, field, n, force=False):
+        if field == "days":
+            if n <= 0:
+                return "Hmm, the number of days can't be zero or negative. 😊 How many days are you planning?"
+            if n > 30:
+                return "That's a really long trip! Please pick between 1 and 30 days. How many days?"
+            if force or not state.get("days"):
+                state["days"] = n
+        else:
+            if n <= 0:
+                return "The number of travelers should be at least 1. 🙂 How many people are traveling?"
+            if n > 50:
+                return "That's a big group! Please enter up to 50 travelers. How many people are traveling?"
+            if force or not state.get("travelers"):
+                state["travelers"] = n
+        return None
+
+    def _valid(self, n, lo, hi):
+        return isinstance(n, int) and lo <= n <= hi
 
     def _have_all(self, state):
         return bool(state.get("days") and state.get("travelers") and state.get("budget_level"))
@@ -359,6 +520,9 @@ Answer with only one word:"""
             return items[0] + " and " + items[1]
         return ", ".join(items[:-1]) + ", and " + items[-1]
 
+    def _city_ack(self, city):
+        return f"{city} — lovely choice! 🎉"
+
     def _unknown_city_msg(self):
         sample = ", ".join(self.city_index.all_cities()[:6])
         return (
@@ -367,36 +531,67 @@ Answer with only one word:"""
             "Which one would you like?"
         )
 
+    def _is_generic_opener(self, msg):
+        t = msg.lower()
+        return ("question" in t and len(t.split()) <= 6 and not self._find_known_city(msg))
+
+    # ================= city detection =================
+    def _set_city(self, state, city):
+        """Set the city. If DIFFERENT from before, clear old trip details."""
+        if city != state.get("city"):
+            for k in ["days", "travelers", "budget_level"]:
+                state.pop(k, None)
+        state.update(city=city, last_city=city)
+
+    def _destination(self, state, msg):
+        known = self._find_known_city(msg)
+        if known:
+            return known
+        if not state.get("city"):
+            name = self._llm_place(msg)
+            if name and name.upper() != "NONE":
+                return ("unknown", name)
+        return None
+
+    def _llm_place(self, msg):
+        prompt = f"""Read the user's message and find if they name a SPECIFIC city
+or town they want to travel to or plan a trip for.
+
+User message: "{msg}"
+
+Rules:
+- If a specific city/town is named, reply with ONLY that place's name.
+- If NO specific city is named (e.g. "plan a trip for me", "suggest a place"),
+  reply with exactly: NONE
+- Reply with just the place name or NONE.
+
+Answer:"""
+        out = self.generator.generate(prompt).strip()
+        out = out.splitlines()[0].strip().strip(".,!?\"'")
+        if not out or len(out.split()) > 3:
+            return "NONE"
+        return out
+
     def _match(self, msg, options):
         for c in options:
             if c.lower() in msg.lower():
                 return c
         return None
 
-    def _extract_city(self, msg):
+    def _find_known_city(self, msg):
+        low = msg.lower()
         for c in self.city_index.all_cities():
-            if c.lower() in msg.lower():
+            if c.lower() in low:
                 return c
-        return None
-
-    def _mentions_a_city(self, msg):
-        """Return a known city if named, 'unknown' if the user clearly asks
-        for a trip to some place we don't have, or None otherwise."""
-        # is a KNOWN city named?
-        known = self._extract_city(msg)
-        if known:
-            return known
-        # do they clearly want a trip for a place, but it's not in our data?
-        trip_words = ["itinerary", "trip", "plan", "visit", "go to", " for "]
-        if any(w in msg.lower() for w in trip_words):
-            # a capitalized place-like word we don't recognize?
-            names = [w.strip(",.?!") for w in msg.split() if w[:1].isupper()]
-            if names:
-                return "unknown"
         return None
 
     def _known(self, city):
         return bool(city) and city.lower() in [c.lower() for c in self.city_index.all_cities()]
+
+    def _reset_task(self, state):
+        for k in ["stage", "categories", "region", "recommended_cities",
+                  "city", "days", "travelers", "budget_level"]:
+            state.pop(k, None)
 
     # ---------------- public entry (used by app.py) ----------------
     def handle(self, state):
